@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useEffect } from 'react'
 
 const API = ''
 
@@ -28,7 +28,6 @@ function ParsePanel({ onParsed }) {
     const f = e.target.files[0]
     if (!f) return
     setFile(f)
-    // Auto-suggest doc_ref and slug from filename
     const base = f.name.replace(/\s*-\s*ENG\.docx?$/i, '').replace(/\s*-\s*VIE\.docx?$/i, '').trim()
     setDocRef(base)
     setDocSlug(base.replace(/[^a-zA-Z0-9]/g, '').substring(0, 25))
@@ -92,10 +91,102 @@ function ParsePanel({ onParsed }) {
   )
 }
 
+// ── Item Modal ─────────────────────────────────────────────────────────────────
+function ItemModal({ item, onSave, onClose }) {
+  const [form, setForm] = useState({ ...item })
+
+  const handleChange = (field, value) => {
+    setForm(f => ({ ...f, [field]: value }))
+  }
+
+  const handleSave = () => {
+    onSave(form)
+    onClose()
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b">
+          <div>
+            <p className="font-mono text-sm text-blue-700 font-semibold">{item.reg_code}</p>
+            <p className="text-xs text-gray-500">{item.doc_ref} · {item.article_no} · {item.chapter}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none">✕</button>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-4 space-y-4">
+          {/* Full text — read-only */}
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Full Paragraph Text</label>
+            <div className="bg-gray-50 border rounded-lg p-3 text-sm text-gray-800 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
+              {item.paragraph_text}
+            </div>
+          </div>
+
+          {/* Editable enrichment fields */}
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Topics</label>
+              <input value={form.topics || ''} onChange={e => handleChange('topics', e.target.value)}
+                className="w-full border rounded px-3 py-1.5 text-sm" placeholder="e.g. Deductible expenses — R&D" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-gray-500 mb-1">Importance</label>
+              <select value={form.importance || 'medium'} onChange={e => handleChange('importance', e.target.value)}
+                className="w-full border rounded px-3 py-1.5 text-sm">
+                <option value="high">High — key rule</option>
+                <option value="medium">Medium — standard provision</option>
+                <option value="low">Low — procedural/admin</option>
+              </select>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Taxonomy Codes (comma-separated)</label>
+            <input value={form.taxonomy_codes || ''} onChange={e => handleChange('taxonomy_codes', e.target.value)}
+              className="w-full border rounded px-3 py-1.5 text-sm font-mono" placeholder="e.g. CIT-08,CIT-09" />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Keywords</label>
+            <input value={form.keywords || ''} onChange={e => handleChange('keywords', e.target.value)}
+              className="w-full border rounded px-3 py-1.5 text-sm" placeholder="e.g. deductible, R&D, conditions" />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Cross References</label>
+            <input value={form.cross_refs || ''} onChange={e => handleChange('cross_refs', e.target.value)}
+              className="w-full border rounded px-3 py-1.5 text-sm" placeholder="e.g. Article 10, Circular 78/2014" />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Notes</label>
+            <textarea value={form.notes || ''} onChange={e => handleChange('notes', e.target.value)}
+              rows={3} className="w-full border rounded px-3 py-1.5 text-sm resize-none"
+              placeholder="Personal notes, practice tips, exam relevance..." />
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-3 px-6 py-4 border-t bg-gray-50">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-gray-600 hover:text-gray-800">Cancel</button>
+          <button onClick={handleSave} className="px-4 py-2 bg-blue-600 text-white text-sm rounded hover:bg-blue-700">
+            ✓ Save Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ── Results Table ─────────────────────────────────────────────────────────────
-function ResultsTable({ session }) {
+function ResultsTable({ session, onItemUpdate }) {
   const [filter, setFilter] = useState({ search: '', level: '', article: '', taxonomy: '' })
   const [page, setPage] = useState(0)
+  const [editItem, setEditItem] = useState(null)
   const PER_PAGE = 50
 
   if (!session) return null
@@ -121,6 +212,41 @@ function ResultsTable({ session }) {
   const LEVEL_COLORS = { letter: 'bg-blue-50 text-blue-700', clause: 'bg-green-50 text-green-700', article: 'bg-purple-50 text-purple-700' }
   const IMP_COLORS = { high: 'text-red-600 font-semibold', medium: 'text-gray-700', low: 'text-gray-400' }
 
+  const handleSaveItem = (updatedItem) => {
+    onItemUpdate(updatedItem)
+  }
+
+  const handleExportCSV = async () => {
+    try {
+      const res = await fetch(`${API}/export/csv/${session.session_id}`)
+      if (res.ok) {
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a'); a.href = url
+        a.download = `${session.meta?.doc_slug || 'taxparse'}_parsed.csv`
+        a.click(); URL.revokeObjectURL(url)
+        return
+      }
+    } catch {}
+
+    // Fallback: client-side CSV from session in memory
+    const FIELDS = ['reg_code','tax_type','doc_ref','chapter','article_no','article_title',
+                    'clause_no','letter','level','topics','taxonomy_codes','keywords',
+                    'importance','cross_refs','paragraph_text','notes']
+    const rows = [FIELDS.join(',')]
+    for (const item of session.items) {
+      rows.push(FIELDS.map(f => {
+        const v = String(item[f] || '')
+        return v.includes(',') || v.includes('\n') ? `"${v.replace(/"/g, '""')}"` : v
+      }).join(','))
+    }
+    const blob = new Blob(['\ufeff' + rows.join('\n')], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${session.meta?.doc_slug || 'taxparse'}_parsed.csv`
+    a.click(); URL.revokeObjectURL(url)
+  }
+
   return (
     <div className="space-y-3">
       {/* Summary */}
@@ -129,10 +255,10 @@ function ResultsTable({ session }) {
         {Object.entries(session.levels || {}).map(([k, v]) => (
           <span key={k} className={`px-2 py-0.5 rounded text-xs ${LEVEL_COLORS[k] || 'bg-gray-100'}`}>{k}: {v}</span>
         ))}
-        <a href={`${API}/export/csv/${session.session_id}`}
+        <button onClick={handleExportCSV}
           className="ml-auto px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">
           ⬇ Export CSV
-        </a>
+        </button>
         <a href={`${API}/export/jsonl/${session.session_id}`}
           className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700">
           ⬇ Export JSONL
@@ -172,6 +298,7 @@ function ResultsTable({ session }) {
               <th className="px-3 py-2 text-left w-32">Topics</th>
               <th className="px-3 py-2 text-left w-28">Taxonomy</th>
               <th className="px-3 py-2 text-left w-16">Imp.</th>
+              <th className="px-3 py-2 text-left w-20">Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -192,6 +319,12 @@ function ResultsTable({ session }) {
                   ))}
                 </td>
                 <td className={`px-3 py-2 text-xs ${IMP_COLORS[item.importance] || ''}`}>{item.importance}</td>
+                <td className="px-3 py-2">
+                  <button onClick={() => setEditItem(item)}
+                    className="text-xs text-blue-600 hover:text-blue-800 underline">
+                    View/Edit
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -208,6 +341,14 @@ function ResultsTable({ session }) {
             className="px-3 py-1 border rounded disabled:opacity-40">Next →</button>
         </div>
       )}
+
+      {editItem && (
+        <ItemModal
+          item={editItem}
+          onSave={handleSaveItem}
+          onClose={() => setEditItem(null)}
+        />
+      )}
     </div>
   )
 }
@@ -216,6 +357,7 @@ function ResultsTable({ session }) {
 function EnrichPanel({ sessionId, onEnriched }) {
   const { loading, error, call } = useApi()
   const [model, setModel] = useState('claude-haiku-4-5')
+  const [lastResult, setLastResult] = useState(null)
 
   const handleEnrich = async () => {
     const result = await call(async () => {
@@ -227,7 +369,10 @@ function EnrichPanel({ sessionId, onEnriched }) {
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Enrich failed') }
       return res.json()
     })
-    if (result) onEnriched()
+    if (result) {
+      setLastResult(result)
+      await onEnriched()
+    }
   }
 
   return (
@@ -235,6 +380,11 @@ function EnrichPanel({ sessionId, onEnriched }) {
       <div>
         <p className="text-sm font-medium text-amber-800">🏷 AI Taxonomy Enrichment</p>
         <p className="text-xs text-amber-600">Classify items into topics & taxonomy codes using AI</p>
+        {lastResult && (
+          <p className="text-xs text-green-700 font-medium mt-1">
+            ✓ Tagged {lastResult.enriched}/{lastResult.total} items
+          </p>
+        )}
       </div>
       <select value={model} onChange={e => setModel(e.target.value)}
         className="border rounded px-2 py-1 text-sm ml-auto">
@@ -253,19 +403,58 @@ function EnrichPanel({ sessionId, onEnriched }) {
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const [session, setSession] = useState(null)
+  const [savedAt, setSavedAt] = useState(null)
+  const [restoredFromCache, setRestoredFromCache] = useState(false)
+
+  // Auto-restore session on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('taxparse_session')
+      const savedAtVal = localStorage.getItem('taxparse_session_saved_at')
+      if (saved) {
+        const parsed = JSON.parse(saved)
+        if (parsed?.items?.length > 0) {
+          setSession(parsed)
+          setSavedAt(savedAtVal)
+          setRestoredFromCache(true)
+        }
+      }
+    } catch {}
+  }, [])
+
+  // Auto-save session to localStorage
+  useEffect(() => {
+    if (session) {
+      try {
+        localStorage.setItem('taxparse_session', JSON.stringify(session))
+        localStorage.setItem('taxparse_session_saved_at', new Date().toISOString())
+      } catch (e) {
+        console.warn('localStorage save failed:', e)
+      }
+    }
+  }, [session])
 
   const handleParsed = (result) => {
+    setRestoredFromCache(false)
     setSession(result)
   }
 
   const handleEnriched = async () => {
     if (!session) return
-    // Re-fetch session to get enriched items
     try {
       const res = await fetch(`${API}/sessions/${session.session_id}?limit=5000`)
       const data = await res.json()
-      setSession(s => ({ ...s, items: data.items, total: data.total }))
-    } catch {}
+      setSession({ ...session, items: data.items, total: data.total, _enriched_at: Date.now() })
+    } catch (e) {
+      console.error('Failed to refresh after enrich:', e)
+    }
+  }
+
+  const handleItemUpdate = (updatedItem) => {
+    setSession(s => ({
+      ...s,
+      items: s.items.map(i => i.reg_code === updatedItem.reg_code ? updatedItem : i)
+    }))
   }
 
   return (
@@ -277,13 +466,27 @@ export default function App() {
         </h1>
       </header>
 
+      {restoredFromCache && (
+        <div className="bg-blue-50 border-b border-blue-200 px-6 py-2 flex items-center gap-3 text-sm text-blue-700">
+          <span>📂 Restored previous session ({session?.total} items) — saved {savedAt ? new Date(savedAt).toLocaleString() : ''}</span>
+          <button onClick={() => {
+            localStorage.removeItem('taxparse_session')
+            localStorage.removeItem('taxparse_session_saved_at')
+            setSession(null)
+            setRestoredFromCache(false)
+          }} className="ml-auto text-xs text-blue-500 hover:text-blue-700 underline">
+            Clear & start fresh
+          </button>
+        </div>
+      )}
+
       <main className="max-w-7xl mx-auto px-6 py-6 space-y-5">
         <ParsePanel onParsed={handleParsed} />
 
         {session && (
           <>
             <EnrichPanel sessionId={session.session_id} onEnriched={handleEnriched} />
-            <ResultsTable session={session} />
+            <ResultsTable session={session} onItemUpdate={handleItemUpdate} />
           </>
         )}
 

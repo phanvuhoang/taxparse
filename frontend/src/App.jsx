@@ -451,16 +451,19 @@ function MatchPanel({ sessionId, onMatched }) {
   }
 
   const pollJob = async (jid) => {
+    let errorCount = 0
     const interval = setInterval(async () => {
       try {
         const res = await fetch(`${API}/jobs/${jid}`)
+        if (!res.ok) { errorCount++; if (errorCount > 5) clearInterval(interval); return }
         const d = await res.json()
+        errorCount = 0
         setJobStatus(d)
         if (d.status === 'done' || d.status === 'failed') {
           clearInterval(interval)
           if (d.status === 'done') onMatched()
         }
-      } catch { clearInterval(interval) }
+      } catch { errorCount++; if (errorCount > 5) clearInterval(interval) }
     }, 1500)
   }
 
@@ -493,6 +496,10 @@ function MatchPanel({ sessionId, onMatched }) {
       </div>
 
       {/* Match */}
+      {/* Hint: match list is in-memory — needs re-upload after page reload */}
+      {!listLoaded && (
+        <p className="text-xs text-purple-500 italic">↑ Upload a CSV/JSON match list first</p>
+      )}
       {listLoaded && (
         <div className="flex items-center gap-3 flex-wrap">
           <select value={model} onChange={e => setModel(e.target.value)}
@@ -541,18 +548,23 @@ function EnrichPanel({ sessionId, onEnriched }) {
   const running = jobStatus?.status === 'running'
 
   const pollJob = (jid) => {
+    let errorCount = 0
     const iv = setInterval(async () => {
       try {
         const r = await fetch(`${API}/jobs/${jid}`)
+        if (!r.ok) { errorCount++; if (errorCount > 5) { clearInterval(iv); setJobStatus(s => ({...s, status:'failed', error:'Lost connection'})) }; return }
         const d = await r.json()
+        errorCount = 0  // reset on success
         setJobStatus(d)
         if (d.status === 'done' || d.status === 'failed') {
           clearInterval(iv)
-          if (d.status === 'done') onEnriched(null)  // re-fetch session to update table
+          if (d.status === 'done') onEnriched(null)
         }
       } catch (e) {
-        console.error('poll error:', e)
-        clearInterval(iv)
+        errorCount++
+        console.warn('poll error #' + errorCount + ':', e.message)
+        if (errorCount > 5) { clearInterval(iv); setJobStatus(s => ({...s, status:'failed', error:'Lost connection after retries'})) }
+        // else: keep polling, transient error
       }
     }, 1500)
   }
@@ -771,6 +783,7 @@ export default function App() {
     </div>
   )
 }
+
 
 
 

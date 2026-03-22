@@ -630,16 +630,23 @@ Rules:
 
 
 from fastapi.staticfiles import StaticFiles
-# Serve frontend static assets — mount /assets BEFORE catch-all routes
+from fastapi.responses import FileResponse
+
+# Serve frontend
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.exists(FRONTEND_DIR):
-    # Mount /assets explicitly so it doesn't get caught by /{session_id} route
+    # Mount /assets explicitly — prevents /{session_id} route from catching it
     assets_dir = os.path.join(FRONTEND_DIR, 'assets')
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-    # Serve SPA — StaticFiles only handles GET, won't interfere with POST routes
-    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+# SPA fallback — defined LAST, GET only, won't shadow any POST/PUT/DELETE routes
+@app.get("/{full_path:path}", include_in_schema=False)
+async def serve_spa(full_path: str):
+    index = os.path.join(FRONTEND_DIR, 'index.html')
+    if os.path.exists(index):
+        return FileResponse(index)
+    return {"error": "Frontend not built"}
 
 
 

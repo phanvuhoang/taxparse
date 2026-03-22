@@ -200,13 +200,13 @@ def enrich_session(data: dict):
     enriched = enrich_items_batch(
         items,
         taxonomy=custom_taxonomy,
-        model=data.get('model', 'claude-haiku-4-5'),
+        model=data.get('model', 'claude-haiku-4.5'),
         batch_size=data.get('batch_size', 15),
         api_key=api_key,
     )
     _sessions[session_id]['items'] = enriched
     tagged = sum(1 for i in enriched if i.get('taxonomy_codes'))
-    return {'session_id': session_id, 'enriched': tagged, 'total': len(enriched)}
+    return {'session_id': session_id, 'enriched': tagged, 'total': len(enriched), 'items': enriched}
 
 
 @app.get('/sessions/{session_id}')
@@ -416,7 +416,7 @@ def run_match(data: dict, background_tasks: BackgroundTasks):
         raise HTTPException(400, 'No parsed items in session')
 
     force = data.get('force', False)
-    model = data.get('model', 'claude-haiku-4-5')
+    model = data.get('model', 'claude-haiku-4.5')
     batch_size = data.get('batch_size', 15)
 
     to_match = items if force else [i for i in items if not i.get('matched_codes')]
@@ -501,3 +501,4 @@ from fastapi.staticfiles import StaticFiles
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.exists(FRONTEND_DIR):
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+

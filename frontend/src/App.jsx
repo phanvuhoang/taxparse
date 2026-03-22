@@ -366,6 +366,49 @@ function ResultsTable({ session, onItemUpdate }) {
   )
 }
 
+// ── Session Toolbar ───────────────────────────────────────────────────────────
+function SessionToolbar({ session, onLoad }) {
+  const [loadError, setLoadError] = useState(null)
+
+  const handleSave = () => {
+    if (!session) return
+    window.location.href = `${API}/sessions/${session.session_id}/save`
+  }
+
+  const handleLoad = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    setLoadError(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch(`${API}/sessions/load`, { method: 'POST', body: fd })
+      const d = await res.json()
+      if (!res.ok) { setLoadError(d.detail || 'Load failed'); return }
+      onLoad(d)
+    } catch (e) {
+      setLoadError(e.message)
+    }
+    e.target.value = ''
+  }
+
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      {session && (
+        <button onClick={handleSave}
+          className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs rounded border border-gray-300 flex items-center gap-1.5">
+          💾 Save session
+        </button>
+      )}
+      <label className="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs rounded border border-gray-300 cursor-pointer flex items-center gap-1.5">
+        📂 Load session
+        <input type="file" accept=".json" onChange={handleLoad} className="hidden" />
+      </label>
+      {loadError && <span className="text-xs text-red-500">{loadError}</span>}
+    </div>
+  )
+}
+
 // ── Match Panel ───────────────────────────────────────────────────────────────
 function MatchPanel({ sessionId, onMatched }) {
   const { loading, error, call } = useApi()
@@ -638,6 +681,25 @@ export default function App() {
     }))
   }
 
+  const handleSessionLoad = async (loadResult) => {
+    try {
+      const res = await fetch(`${API}/sessions/${loadResult.session_id}?limit=5000`)
+      const data = await res.json()
+      setSession({
+        session_id: loadResult.session_id,
+        items: data.items,
+        total: loadResult.total,
+        meta: loadResult.meta,
+        _loaded_from_file: true,
+        _enriched: loadResult.enriched,
+        _matched: loadResult.matched,
+      })
+      setRestoredFromCache(false)
+    } catch (e) {
+      console.error('Failed to load session items:', e)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b px-6 py-4">
@@ -664,8 +726,34 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-6 py-6 space-y-5">
         <ParsePanel onParsed={handleParsed} />
 
+        <SessionToolbar session={session} onLoad={handleSessionLoad} />
+
         {session && (
           <>
+            {/* Status bar */}
+            <div className="flex items-center gap-4 text-xs text-gray-500 px-1">
+              <span>📄 {session.total} items</span>
+              {(() => {
+                const enrichedCount = session.items?.filter(i => i.taxonomy_codes).length || 0
+                const matchedCount = session.items?.filter(i => i.matched_codes).length || 0
+                return (
+                  <>
+                    <span className={enrichedCount > 0 ? 'text-amber-700' : ''}>
+                      🏷 {enrichedCount}/{session.total} enriched
+                    </span>
+                    {matchedCount > 0 && (
+                      <span className="text-purple-700">🔗 {matchedCount}/{session.total} matched</span>
+                    )}
+                    {enrichedCount < session.total && enrichedCount > 0 && (
+                      <span className="text-blue-600 font-medium">
+                        ▸ {session.total - enrichedCount} items still need enrichment
+                      </span>
+                    )}
+                  </>
+                )
+              })()}
+            </div>
+
             <EnrichPanel sessionId={session.session_id} onEnriched={handleEnriched} />
             <MatchPanel sessionId={session.session_id} onMatched={handleEnriched} />
             <ResultsTable session={session} onItemUpdate={handleItemUpdate} />

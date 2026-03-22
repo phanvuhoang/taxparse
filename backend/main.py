@@ -22,7 +22,7 @@ import logging
 import threading
 from typing import Optional, List, Dict
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response as FastAPIResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.parser import parse_regulation, parse_paragraphs, items_to_csv, items_to_jsonl
@@ -393,6 +393,73 @@ def list_catalog():
             'available': os.path.exists(fpath),
         })
     return result
+
+
+@app.post('/sessions/load')
+async def load_session(file: UploadFile = File(...)):
+    """Load a saved .taxparse.json file. Creates a new session with the saved items."""
+    content = await file.read()
+    try:
+        data = json.loads(content)
+    except Exception:
+        raise HTTPException(400, 'Invalid JSON file')
+
+    if data.get('version') != 1 or 'items' not in data:
+        raise HTTPException(400, 'Invalid .taxparse.json format')
+
+    items = data['items']
+    meta = data.get('meta', {})
+
+    session_id = str(uuid.uuid4())[:8]
+    _sessions[session_id] = {
+        'items': items,
+        'meta': {
+            **meta,
+            'loaded_from_file': file.filename,
+            'loaded_at': time.time(),
+        }
+    }
+
+    enriched = sum(1 for i in items if i.get('taxonomy_codes'))
+    matched = sum(1 for i in items if i.get('matched_codes'))
+
+    return {
+        'session_id': session_id,
+        'total': len(items),
+        'enriched': enriched,
+        'matched': matched,
+        'meta': meta,
+    }
+
+
+@app.get('/sessions/{session_id}/save')
+def save_session(session_id: str):
+    """Download current session as .taxparse.json"""
+    if session_id not in _sessions:
+        raise HTTPException(404, 'Session not found')
+
+    sess = _sessions[session_id]
+    items = sess['items']
+    meta = sess.get('meta', {})
+
+    output = {
+        'version': 1,
+        'saved_at': __import__('datetime').datetime.utcnow().isoformat() + 'Z',
+        'meta': {
+            'doc_slug': meta.get('doc_slug', meta.get('source', 'session')),
+            'tax_type': meta.get('tax_type', 'CIT'),
+            'source': meta.get('source', 'upload'),
+            'total': len(items),
+        },
+        'items': items,
+    }
+
+    filename = f"{meta.get('doc_slug', session_id)}_taxparse.json"
+    return FastAPIResponse(
+        content=json.dumps(output, ensure_ascii=False, indent=2),
+        media_type='application/json',
+        headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+    )
 
 
 @app.post('/match-list')

@@ -640,13 +640,30 @@ if os.path.exists(FRONTEND_DIR):
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-# SPA fallback — defined LAST, GET only, won't shadow any POST/PUT/DELETE routes
-@app.get("/{full_path:path}", include_in_schema=False)
-async def serve_spa(full_path: str):
-    index = os.path.join(FRONTEND_DIR, 'index.html')
-    if os.path.exists(index):
-        return FileResponse(index)
-    return {"error": "Frontend not built"}
+# SPA fallback — handle GET + HEAD only for non-API paths
+# Using Starlette middleware approach to avoid FastAPI's 405 on path match
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import FileResponse as StarletteFileResponse
+
+class SPAMiddleware(BaseHTTPMiddleware):
+    """Serve index.html for all GET requests that don't match API routes or /assets."""
+    API_PATHS = {
+        'health', 'parse', 'enrich', 'sessions', 'taxonomy',
+        'export', 'jobs', 'catalog', 'match', 'match-list',
+    }
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        # If the route returned 404 or 405 for a GET browser request (not API/assets)
+        if (response.status_code in (404, 405)
+                and request.method == 'GET'
+                and not request.url.path.startswith('/assets/')
+                and request.url.path.split('/')[1] not in self.API_PATHS):
+            index = os.path.join(FRONTEND_DIR, 'index.html')
+            if os.path.exists(index):
+                return StarletteFileResponse(index)
+        return response
+
+app.add_middleware(SPAMiddleware)
 
 
 

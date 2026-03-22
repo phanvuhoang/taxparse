@@ -121,7 +121,7 @@ def parse_paragraphs(
             'clause_no':     clause_no,
             'letter':        letter,
             'level':         level,
-            'paragraph_text': text[:2000],
+            'paragraph_text': text,
         }
 
     def flush_letter():
@@ -132,7 +132,7 @@ def parse_paragraphs(
             return
         # Prepend clause intro (first line of clause) for context
         intro = cur_clause_lines[0] if cur_clause_lines else ''
-        full_text = (intro[:200] + '\n' + text) if intro and intro not in text else text
+        full_text = (intro + '\n' + text) if intro and intro not in text else text
         code = f'{tax_type}-{doc_slug}-Art{cur_art_no}.{cur_clause_no}.{cur_letter}'
         items.append(_make_item(code, 'letter', full_text, cur_clause_no, cur_letter))
 

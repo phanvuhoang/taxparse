@@ -1,6 +1,13 @@
 import React, { useState, useCallback, useEffect } from 'react'
 
-const API = ''
+const getAPI = () => {
+  try {
+    return window.location.origin === 'http://localhost:5173'
+      ? 'http://localhost:8000'
+      : window.location.origin
+  } catch { return '' }
+}
+const API = getAPI()
 
 function useApi() {
   const [loading, setLoading] = useState(false)
@@ -121,7 +128,7 @@ function ItemModal({ item, onSave, onClose }) {
           {/* Full text — read-only */}
           <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Full Paragraph Text</label>
-            <div className="bg-gray-50 border rounded-lg p-3 text-sm text-gray-800 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto">
+            <div className="bg-gray-50 border rounded-lg p-3 text-sm text-gray-800 whitespace-pre-wrap leading-relaxed max-h-96 overflow-y-auto">
               {item.paragraph_text}
             </div>
           </div>
@@ -190,7 +197,7 @@ function ItemModal({ item, onSave, onClose }) {
 }
 
 // ── Results Table ─────────────────────────────────────────────────────────────
-function ResultsTable({ session, onItemUpdate }) {
+function ResultsTable({ session, onItemUpdate, onRefresh }) {
   const [filter, setFilter] = useState({ search: '', level: '', article: '', taxonomy: '' })
   const [page, setPage] = useState(0)
   const [editItem, setEditItem] = useState(null)
@@ -221,6 +228,27 @@ function ResultsTable({ session, onItemUpdate }) {
 
   const handleSaveItem = (updatedItem) => {
     onItemUpdate(updatedItem)
+  }
+
+  const handleExportJSONL = async () => {
+    try {
+      const res = await fetch(`${API}/export/jsonl/${session.session_id}`)
+      if (res.ok) {
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a'); a.href = url
+        a.download = `${session.meta?.doc_slug || 'taxparse'}_parsed.jsonl`
+        a.click(); URL.revokeObjectURL(url)
+        return
+      }
+    } catch {}
+    // Fallback: client-side JSONL from session items
+    const lines = session.items.map(i => JSON.stringify(i)).join('\n')
+    const blob = new Blob([lines], { type: 'application/x-ndjson' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a'); a.href = url
+    a.download = `${session.meta?.doc_slug || 'taxparse'}_parsed.jsonl`
+    a.click(); URL.revokeObjectURL(url)
   }
 
   const handleExportCSV = async () => {
@@ -262,14 +290,19 @@ function ResultsTable({ session, onItemUpdate }) {
         {Object.entries(session.levels || {}).map(([k, v]) => (
           <span key={k} className={`px-2 py-0.5 rounded text-xs ${LEVEL_COLORS[k] || 'bg-gray-100'}`}>{k}: {v}</span>
         ))}
+        <button onClick={onRefresh}
+          className="ml-auto px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600"
+          title="Re-fetch enrichment results from backend">
+          🔄 Refresh
+        </button>
         <button onClick={handleExportCSV}
-          className="ml-auto px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">
+          className="px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700">
           ⬇ Export CSV
         </button>
-        <a href={`${API}/export/jsonl/${session.session_id}`}
+        <button onClick={handleExportJSONL}
           className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700">
           ⬇ Export JSONL
-        </a>
+        </button>
       </div>
 
       {/* Filters */}
@@ -618,7 +651,12 @@ function EnrichPanel({ sessionId, onEnriched }) {
                 <span>{jobStatus.progress||0} / {jobStatus.total||'?'} items ({pct}%)</span>
               </>
             ) : jobStatus.status === 'done' ? (
-              <span className="text-green-700 font-medium">✓ Done — tagged {jobStatus.matched}/{jobStatus.total} items. Refresh table to see results.</span>
+              <span className="text-green-700 font-medium">
+                ✓ Done — tagged {jobStatus.matched}/{jobStatus.total} items.
+                {' '}<button className="underline text-blue-600 hover:text-blue-800" onClick={() => onEnriched(null)}>
+                  Refresh table ↻
+                </button>
+              </span>
             ) : (
               <span className="text-red-600">⚠ {jobStatus.error || 'Enrichment failed'}</span>
             )}
@@ -642,19 +680,32 @@ export default function App() {
   const [savedAt, setSavedAt] = useState(null)
   const [restoredFromCache, setRestoredFromCache] = useState(false)
 
-  // Auto-restore session on mount
+  // Auto-restore session on mount — validate against backend first
   useEffect(() => {
     try {
       const saved = localStorage.getItem('taxparse_session')
       const savedAtVal = localStorage.getItem('taxparse_session_saved_at')
-      if (saved) {
-        const parsed = JSON.parse(saved)
-        if (parsed?.items?.length > 0) {
-          setSession(parsed)
+      if (!saved) return
+      const parsed = JSON.parse(saved)
+      if (!parsed?.items?.length) return
+
+      fetch(`${API}/sessions/${parsed.session_id}?limit=1`)
+        .then(r => {
+          if (r.ok) {
+            setSession(parsed)
+            setSavedAt(savedAtVal)
+            setRestoredFromCache(true)
+          } else {
+            setSession({ ...parsed, _local_only: true })
+            setSavedAt(savedAtVal)
+            setRestoredFromCache(true)
+          }
+        })
+        .catch(() => {
+          setSession({ ...parsed, _local_only: true })
           setSavedAt(savedAtVal)
           setRestoredFromCache(true)
-        }
-      }
+        })
     } catch {}
   }, [])
 
@@ -768,7 +819,7 @@ export default function App() {
 
             <EnrichPanel sessionId={session.session_id} onEnriched={handleEnriched} />
             <MatchPanel sessionId={session.session_id} onMatched={handleEnriched} />
-            <ResultsTable session={session} onItemUpdate={handleItemUpdate} />
+            <ResultsTable session={session} onItemUpdate={handleItemUpdate} onRefresh={handleEnriched} />
           </>
         )}
 

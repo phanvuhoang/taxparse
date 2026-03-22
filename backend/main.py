@@ -632,38 +632,20 @@ Rules:
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
-# Serve frontend
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
+
+# 1. Mount /assets first — prevents /{session_id} route from catching it
 if os.path.exists(FRONTEND_DIR):
-    # Mount /assets explicitly — prevents /{session_id} route from catching it
     assets_dir = os.path.join(FRONTEND_DIR, 'assets')
     if os.path.exists(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
-# SPA fallback — handle GET + HEAD only for non-API paths
-# Using Starlette middleware approach to avoid FastAPI's 405 on path match
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import FileResponse as StarletteFileResponse
+# 2. SPA index.html — explicit GET route only (does NOT interfere with POST/PUT/DELETE)
+_index_html = os.path.join(FRONTEND_DIR, 'index.html')
 
-class SPAMiddleware(BaseHTTPMiddleware):
-    """Serve index.html for all GET requests that don't match API routes or /assets."""
-    API_PATHS = {
-        'health', 'parse', 'enrich', 'sessions', 'taxonomy',
-        'export', 'jobs', 'catalog', 'match', 'match-list',
-    }
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        # If the route returned 404 or 405 for a GET browser request (not API/assets)
-        if (response.status_code in (404, 405)
-                and request.method == 'GET'
-                and not request.url.path.startswith('/assets/')
-                and request.url.path.split('/')[1] not in self.API_PATHS):
-            index = os.path.join(FRONTEND_DIR, 'index.html')
-            if os.path.exists(index):
-                return StarletteFileResponse(index)
-        return response
-
-app.add_middleware(SPAMiddleware)
+@app.get("/", include_in_schema=False)
+async def spa_root():
+    return FileResponse(_index_html)
 
 
 

@@ -375,13 +375,15 @@ function MatchPanel({ sessionId, onMatched }) {
   const [jobStatus, setJobStatus] = useState(null)
   const [model, setModel] = useState('claude-haiku-4.5')
 
-  const handleUpload = async () => {
-    if (!file) return
+  const handleUpload = async (selectedFile) => {
+    const f = selectedFile || file
+    if (!f) return
+    setListLoaded(null)
     const result = await call(async () => {
       const fd = new FormData()
-      fd.append('file', file)
+      fd.append('file', f)
       fd.append('session_id', sessionId)
-      const res = await fetch('/match-list', { method: 'POST', body: fd })
+      const res = await fetch(`${API}/match-list`, { method: 'POST', body: fd })
       if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Upload failed') }
       return res.json()
     })
@@ -390,7 +392,7 @@ function MatchPanel({ sessionId, onMatched }) {
 
   const handleMatch = async () => {
     const result = await call(async () => {
-      const res = await fetch('/match', {
+      const res = await fetch(`${API}/match`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, model }),
@@ -408,7 +410,7 @@ function MatchPanel({ sessionId, onMatched }) {
   const pollJob = async (jid) => {
     const interval = setInterval(async () => {
       try {
-        const res = await fetch(`/jobs/${jid}`)
+        const res = await fetch(`${API}/jobs/${jid}`)
         const d = await res.json()
         setJobStatus(d)
         if (d.status === 'done' || d.status === 'failed') {
@@ -431,12 +433,10 @@ function MatchPanel({ sessionId, onMatched }) {
 
       {/* Upload */}
       <div className="flex items-center gap-3 flex-wrap">
-        <input type="file" accept=".csv,.json" onChange={e => setFile(e.target.files[0])}
+        <input type="file" accept=".csv,.json"
+          onChange={e => { const f = e.target.files[0]; setFile(f); if(f) handleUpload(f) }}
           className="text-xs text-gray-600 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-purple-100 file:text-purple-700" />
-        <button onClick={handleUpload} disabled={!file || loading}
-          className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded hover:bg-purple-700 disabled:opacity-50">
-          {loading ? 'Loading...' : '⬆ Load List'}
-        </button>
+        {loading && <span className="text-xs text-purple-600 animate-pulse">Loading list…</span>}
         {listLoaded && (
           <span className="text-xs text-green-700 font-medium">
             ✓ {listLoaded.loaded} codes loaded
@@ -492,47 +492,88 @@ function MatchPanel({ sessionId, onMatched }) {
 
 // ── Enrich Panel ──────────────────────────────────────────────────────────────
 function EnrichPanel({ sessionId, onEnriched }) {
-  const { loading, error, call } = useApi()
   const [model, setModel] = useState('claude-haiku-4.5')
-  const [lastResult, setLastResult] = useState(null)
+  const [jobStatus, setJobStatus] = useState(null)   // {status, progress, total, matched}
+  const [error, setError] = useState(null)
+  const running = jobStatus?.status === 'running'
+
+  const pollJob = (jid) => {
+    const iv = setInterval(async () => {
+      try {
+        const r = await fetch(`${API}/jobs/${jid}`)
+        const d = await r.json()
+        setJobStatus(d)
+        if (d.status === 'done' || d.status === 'failed') {
+          clearInterval(iv)
+          if (d.status === 'done') onEnriched(null)  // trigger re-fetch from session
+        }
+      } catch { clearInterval(iv) }
+    }, 1200)
+  }
 
   const handleEnrich = async () => {
-    const result = await call(async () => {
+    setError(null)
+    setJobStatus({ status: 'running', progress: 0, total: 0, matched: 0 })
+    try {
       const res = await fetch(`${API}/enrich`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId, model }),
       })
-      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Enrich failed') }
-      return res.json()
-    })
-    if (result) {
-      setLastResult(result)
-      onEnriched(result.items || null)   // pass enriched items directly — no re-fetch needed
+      const d = await res.json()
+      if (!res.ok) { setError(d.detail || 'Enrich failed'); setJobStatus(null); return }
+      setJobStatus(s => ({ ...s, total: d.total }))
+      pollJob(d.job_id)
+    } catch (e) {
+      setError(e.message)
+      setJobStatus(null)
     }
   }
 
+  const pct = jobStatus?.total > 0 ? Math.round((jobStatus.progress / jobStatus.total) * 100) : 0
+
   return (
-    <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-center gap-4">
-      <div>
-        <p className="text-sm font-medium text-amber-800">🏷 AI Taxonomy Enrichment</p>
-        <p className="text-xs text-amber-600">Classify items into topics & taxonomy codes using AI</p>
-        {lastResult && (
-          <p className="text-xs text-green-700 font-medium mt-1">
-            ✓ Tagged {lastResult.enriched}/{lastResult.total} items
-          </p>
-        )}
+    <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 space-y-2">
+      <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-amber-800">🏷 AI Taxonomy Enrichment</p>
+          <p className="text-xs text-amber-600">Classify items into topics, taxonomy codes & keywords using AI</p>
+        </div>
+        <select value={model} onChange={e => setModel(e.target.value)}
+          className="border rounded px-2 py-1 text-sm" disabled={running}>
+          <option value="claude-haiku-4.5">Haiku (fast)</option>
+          <option value="claude-sonnet-4.6">Sonnet (accurate)</option>
+        </select>
+        <button onClick={handleEnrich} disabled={running}
+          className="px-4 py-2 bg-amber-600 text-white text-sm rounded hover:bg-amber-700 disabled:opacity-50 whitespace-nowrap">
+          {running ? 'Enriching…' : '▶ Run AI Enrich'}
+        </button>
       </div>
-      <select value={model} onChange={e => setModel(e.target.value)}
-        className="border rounded px-2 py-1 text-sm ml-auto">
-        <option value="claude-haiku-4.5">Haiku (fast/cheap)</option>
-        <option value="claude-sonnet-4.6">Sonnet (better quality)</option>
-      </select>
-      {error && <p className="text-red-500 text-xs">{error}</p>}
-      <button onClick={handleEnrich} disabled={loading}
-        className="px-4 py-2 bg-amber-600 text-white text-sm rounded hover:bg-amber-700 disabled:opacity-50 whitespace-nowrap">
-        {loading ? 'Enriching...' : '▶ Run AI Enrich'}
-      </button>
+
+      {/* Progress bar */}
+      {running && (
+        <div className="space-y-1">
+          <div className="flex justify-between text-xs text-amber-700">
+            <span>Processing batch {Math.ceil((jobStatus.progress||0)/15)}/{Math.ceil((jobStatus.total||1)/15)}…</span>
+            <span>{jobStatus.progress||0}/{jobStatus.total||'?'} items ({pct}%)</span>
+          </div>
+          <div className="w-full bg-amber-200 rounded-full h-2">
+            <div className="bg-amber-600 h-2 rounded-full transition-all duration-500"
+              style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      )}
+
+      {/* Result */}
+      {jobStatus?.status === 'done' && (
+        <p className="text-xs text-green-700 font-medium">
+          ✓ Tagged {jobStatus.matched}/{jobStatus.total} items — download CSV to see all results
+        </p>
+      )}
+      {jobStatus?.status === 'failed' && (
+        <p className="text-xs text-red-600">⚠ {jobStatus.error || 'Enrichment failed'}</p>
+      )}
+      {error && <p className="text-red-500 text-xs">⚠ {error}</p>}
     </div>
   )
 }
@@ -576,18 +617,15 @@ export default function App() {
     setSession(result)
   }
 
-  const handleEnriched = (enrichedItems) => {
+  const handleEnriched = (_ignored) => {
     if (!session) return
-    if (enrichedItems && enrichedItems.length > 0) {
-      // Use items returned directly from /enrich — no re-fetch (avoids session-not-found after restart)
-      setSession(s => ({ ...s, items: enrichedItems, total: enrichedItems.length, _enriched_at: Date.now() }))
-    } else {
-      // Fallback: try re-fetch from backend (items may still be in memory)
-      fetch(`${API}/sessions/${session.session_id}?limit=5000`)
-        .then(r => r.ok ? r.json() : null)
-        .then(data => { if (data?.items) setSession(s => ({ ...s, items: data.items, _enriched_at: Date.now() })) })
-        .catch(() => {})  // silent — session may have expired
-    }
+    // Re-fetch enriched items from backend session (still in memory — same container)
+    fetch(`${API}/sessions/${session.session_id}?limit=5000`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data?.items) setSession(s => ({ ...s, items: data.items, total: data.total, _enriched_at: Date.now() }))
+      })
+      .catch(() => {})
   }
 
   const handleItemUpdate = (updatedItem) => {
@@ -642,4 +680,5 @@ export default function App() {
     </div>
   )
 }
+
 

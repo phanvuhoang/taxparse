@@ -12,10 +12,12 @@ Endpoints:
   GET  /jobs/{job_id}  — poll background job
 """
 import os
+import re
 import uuid
 import json
 import csv
 import io
+import time
 import logging
 import threading
 from typing import Optional, List, Dict
@@ -63,6 +65,41 @@ FILE_CATALOG = [
 
 DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
 REGS_DIR = os.path.join(DATA_DIR, 'regulations')
+
+
+# ── AI helpers ────────────────────────────────────────────────────────────────
+
+def _get_api_config_from_env():
+    """Returns (endpoint, api_key, provider)"""
+    claudible_key = os.environ.get('CLAUDIBLE_API_KEY', '').strip()
+    anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+    if claudible_key:
+        return 'https://claudible.io/v1/chat/completions', claudible_key, 'claudible'
+    elif anthropic_key:
+        return 'https://api.anthropic.com/v1/messages', anthropic_key, 'anthropic'
+    return None, None, None
+
+
+def _call_ai_openai(prompt: str, model: str, endpoint: str, api_key: str) -> str:
+    """Call Claudible (OpenAI-compatible) or Anthropic API."""
+    import urllib.request as ureq
+    is_claudible = 'claudible' in endpoint
+    payload = json.dumps({
+        'model': model, 'max_tokens': 3000,
+        'messages': [{'role': 'user', 'content': prompt}]
+    }).encode()
+    headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'OpenClaw/1.0',
+        **(
+            {'Authorization': f'Bearer {api_key}'} if is_claudible
+            else {'x-api-key': api_key, 'anthropic-version': '2023-06-01'}
+        )
+    }
+    req = ureq.Request(endpoint, data=payload, headers=headers)
+    with ureq.urlopen(req, timeout=60) as r:
+        d = json.loads(r.read())
+        return d['choices'][0]['message']['content'] if is_claudible else d['content'][0]['text']
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -230,8 +267,9 @@ def export_csv(session_id: str):
     FIELDS = [
         'reg_code', 'tax_type', 'doc_ref', 'chapter',
         'article_no', 'article_title', 'clause_no', 'letter', 'level',
-        'topics', 'taxonomy_codes', 'keywords', 'importance', 'cross_refs',
-        'paragraph_text', 'syllabus_codes', 'notes',
+        'topics', 'taxonomy_codes', 'matched_codes',
+        'keywords', 'importance', 'cross_refs',
+        'paragraph_text', 'notes',
     ]
     output = io.StringIO()
     # UTF-8 BOM for Excel compatibility
@@ -288,6 +326,173 @@ def list_catalog():
             'available': os.path.exists(fpath),
         })
     return result
+
+
+@app.post('/match-list')
+async def upload_match_list(
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+    code_column: str = Form(default='code'),
+    desc_column: str = Form(default='description'),
+):
+    """
+    Upload CSV or JSON match list.
+    Returns preview of parsed codes.
+    """
+    import csv as _csv, io as _io
+
+    content = await file.read()
+    suffix = os.path.splitext(file.filename)[1].lower()
+
+    codes = {}  # {code: description_text}
+
+    if suffix == '.json':
+        data = json.loads(content)
+        if isinstance(data, list):
+            for row in data:
+                code = str(row.get(code_column) or row.get('code') or row.get('Code') or '').strip()
+                desc_parts = []
+                for col in [desc_column, 'description', 'Description', 'detailed_syllabus',
+                             'Detailed Syllabus', 'topic', 'Topic']:
+                    if col in row and row[col]:
+                        desc_parts.append(str(row[col]).strip())
+                if code:
+                    codes[code] = ' — '.join(dict.fromkeys(desc_parts))[:200]
+        elif isinstance(data, dict):
+            codes = {str(k): str(v)[:200] for k, v in data.items()}
+
+    elif suffix == '.csv':
+        reader = _csv.DictReader(_io.StringIO(content.decode('utf-8-sig')))
+        for row in reader:
+            code = None
+            for col in [code_column, 'code', 'Code', 'CODE', 'syllabus_code', 'SyllabusCode']:
+                if col in row:
+                    code = str(row[col]).strip()
+                    break
+
+            desc_parts = []
+            for col in [desc_column, 'description', 'Description', 'topic', 'Topic',
+                        'detailed_syllabus', 'Detailed Syllabus', 'category', 'Category']:
+                if col in row and row[col] and col != (code_column or 'code'):
+                    desc_parts.append(str(row[col]).strip())
+
+            if code:
+                codes[code] = ' — '.join(dict.fromkeys(filter(None, desc_parts)))[:200]
+
+    else:
+        raise HTTPException(400, f"Unsupported file type: {suffix}. Use .csv or .json")
+
+    if not codes:
+        raise HTTPException(400, "No codes found in file. Check column names.")
+
+    if session_id not in _sessions:
+        _sessions[session_id] = {'items': [], 'meta': {}}
+    _sessions[session_id]['match_list'] = codes
+
+    return {
+        "loaded": len(codes),
+        "preview": dict(list(codes.items())[:5]),
+        "columns_detected": list(codes.keys())[:3],
+    }
+
+
+@app.post('/match')
+def run_match(data: dict, background_tasks: BackgroundTasks):
+    """
+    Match parsed items against custom list using AI.
+    Body: { session_id, model?, batch_size?, force? }
+    Returns job_id for polling.
+    """
+    session_id = data.get('session_id')
+    if session_id not in _sessions:
+        raise HTTPException(404, 'Session not found')
+
+    match_list = _sessions[session_id].get('match_list')
+    if not match_list:
+        raise HTTPException(400, 'No match list loaded. Upload one first via /match-list')
+
+    items = _sessions[session_id]['items']
+    if not items:
+        raise HTTPException(400, 'No parsed items in session')
+
+    force = data.get('force', False)
+    model = data.get('model', 'claude-haiku-4-5')
+    batch_size = data.get('batch_size', 15)
+
+    to_match = items if force else [i for i in items if not i.get('matched_codes')]
+
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {
+        'status': 'running',
+        'progress': 0,
+        'total': len(to_match),
+        'matched': 0,
+        'result': None,
+    }
+
+    def run():
+        endpoint, key, provider = _get_api_config_from_env()
+        if not key:
+            _jobs[job_id]['status'] = 'failed'
+            _jobs[job_id]['error'] = 'No API key configured'
+            return
+
+        match_list_text = '\n'.join(
+            f'- [{code}] {desc}' for code, desc in list(match_list.items())[:80]
+        )
+
+        matched_count = 0
+        for i in range(0, len(to_match), batch_size):
+            batch = to_match[i:i + batch_size]
+            items_text = '\n\n'.join(
+                f'[{item["reg_code"]}]\n{item.get("paragraph_text","")[:300]}'
+                for item in batch
+            )
+
+            prompt = f"""Match each regulation item to the most relevant codes from the list below.
+
+MATCH LIST:
+{match_list_text}
+
+REGULATION ITEMS:
+{items_text}
+
+Return ONLY valid JSON mapping reg_code to array of matching codes:
+{{
+  "CIT-Decree320-2025-Art9.1.a": ["B2a", "B2b"],
+  "CIT-Decree320-2025-Art23.1": ["C1a"]
+}}
+
+Rules:
+- 1-3 codes per item that are DIRECTLY relevant
+- Empty array [] if genuinely no match
+- Use ONLY codes that appear in the match list above
+"""
+            try:
+                response = _call_ai_openai(prompt, model, endpoint, key)
+                json_match = re.search(r'\{[\s\S]+\}', response)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    for item in batch:
+                        codes = result.get(item['reg_code'], [])
+                        item['matched_codes'] = ','.join(codes)
+                        if codes:
+                            matched_count += 1
+            except Exception as e:
+                logger.warning(f"Match batch {i//batch_size+1} failed: {e}")
+
+            _jobs[job_id]['progress'] = min(i + batch_size, len(to_match))
+            _jobs[job_id]['matched'] = matched_count
+
+            if i + batch_size < len(to_match):
+                time.sleep(0.3)
+
+        _jobs[job_id]['status'] = 'done'
+        _jobs[job_id]['matched'] = matched_count
+        _jobs[job_id]['total'] = len(to_match)
+
+    background_tasks.add_task(run)
+    return {'job_id': job_id, 'total': len(to_match)}
 
 
 from fastapi.staticfiles import StaticFiles

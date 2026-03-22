@@ -151,6 +151,13 @@ function ItemModal({ item, onSave, onClose }) {
           </div>
 
           <div>
+            <label className="block text-xs font-medium text-gray-500 mb-1">Matched Codes (comma-separated)</label>
+            <input value={form.matched_codes || ''} onChange={e => handleChange('matched_codes', e.target.value)}
+              className="w-full border rounded px-3 py-1.5 text-sm font-mono"
+              placeholder="e.g. A1a,B2b (from uploaded match list)" />
+          </div>
+
+          <div>
             <label className="block text-xs font-medium text-gray-500 mb-1">Keywords</label>
             <input value={form.keywords || ''} onChange={e => handleChange('keywords', e.target.value)}
               className="w-full border rounded px-3 py-1.5 text-sm" placeholder="e.g. deductible, R&D, conditions" />
@@ -231,8 +238,8 @@ function ResultsTable({ session, onItemUpdate }) {
 
     // Fallback: client-side CSV from session in memory
     const FIELDS = ['reg_code','tax_type','doc_ref','chapter','article_no','article_title',
-                    'clause_no','letter','level','topics','taxonomy_codes','keywords',
-                    'importance','cross_refs','paragraph_text','notes']
+                    'clause_no','letter','level','topics','taxonomy_codes','matched_codes',
+                    'keywords','importance','cross_refs','paragraph_text','notes']
     const rows = [FIELDS.join(',')]
     for (const item of session.items) {
       rows.push(FIELDS.map(f => {
@@ -297,6 +304,7 @@ function ResultsTable({ session, onItemUpdate }) {
               <th className="px-3 py-2 text-left">Paragraph Text</th>
               <th className="px-3 py-2 text-left w-32">Topics</th>
               <th className="px-3 py-2 text-left w-28">Taxonomy</th>
+              <th className="px-3 py-2 text-left w-28">Matched</th>
               <th className="px-3 py-2 text-left w-16">Imp.</th>
               <th className="px-3 py-2 text-left w-20">Actions</th>
             </tr>
@@ -316,6 +324,11 @@ function ResultsTable({ session, onItemUpdate }) {
                 <td className="px-3 py-2">
                   {(item.taxonomy_codes || '').split(',').filter(Boolean).map(c => (
                     <span key={c} className="inline-block bg-amber-100 text-amber-800 text-xs px-1 rounded mr-1 mb-0.5">{c}</span>
+                  ))}
+                </td>
+                <td className="px-3 py-2">
+                  {(item.matched_codes || '').split(',').filter(Boolean).map(c => (
+                    <span key={c} className="inline-block bg-purple-100 text-purple-800 text-xs px-1 rounded mr-1 mb-0.5">{c}</span>
                   ))}
                 </td>
                 <td className={`px-3 py-2 text-xs ${IMP_COLORS[item.importance] || ''}`}>{item.importance}</td>
@@ -349,6 +362,130 @@ function ResultsTable({ session, onItemUpdate }) {
           onClose={() => setEditItem(null)}
         />
       )}
+    </div>
+  )
+}
+
+// ── Match Panel ───────────────────────────────────────────────────────────────
+function MatchPanel({ sessionId, onMatched }) {
+  const { loading, error, call } = useApi()
+  const [file, setFile] = useState(null)
+  const [listLoaded, setListLoaded] = useState(null)
+  const [jobId, setJobId] = useState(null)
+  const [jobStatus, setJobStatus] = useState(null)
+  const [model, setModel] = useState('claude-haiku-4-5')
+
+  const handleUpload = async () => {
+    if (!file) return
+    const result = await call(async () => {
+      const fd = new FormData()
+      fd.append('file', file)
+      fd.append('session_id', sessionId)
+      const res = await fetch('/match-list', { method: 'POST', body: fd })
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Upload failed') }
+      return res.json()
+    })
+    if (result) setListLoaded(result)
+  }
+
+  const handleMatch = async () => {
+    const result = await call(async () => {
+      const res = await fetch('/match', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, model }),
+      })
+      if (!res.ok) { const d = await res.json(); throw new Error(d.detail || 'Match failed') }
+      return res.json()
+    })
+    if (result?.job_id) {
+      setJobId(result.job_id)
+      setJobStatus({ status: 'running', progress: 0, total: result.total })
+      pollJob(result.job_id)
+    }
+  }
+
+  const pollJob = async (jid) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/jobs/${jid}`)
+        const d = await res.json()
+        setJobStatus(d)
+        if (d.status === 'done' || d.status === 'failed') {
+          clearInterval(interval)
+          if (d.status === 'done') onMatched()
+        }
+      } catch { clearInterval(interval) }
+    }, 1500)
+  }
+
+  const progressPct = jobStatus?.total > 0
+    ? Math.round((jobStatus.progress / jobStatus.total) * 100) : 0
+
+  return (
+    <div className="bg-purple-50 border border-purple-200 rounded-xl p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <p className="text-sm font-medium text-purple-800">🔗 Custom Match List</p>
+        <span className="text-xs text-purple-500">Upload syllabus or taxonomy CSV/JSON → AI match each item</span>
+      </div>
+
+      {/* Upload */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <input type="file" accept=".csv,.json" onChange={e => setFile(e.target.files[0])}
+          className="text-xs text-gray-600 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-xs file:bg-purple-100 file:text-purple-700" />
+        <button onClick={handleUpload} disabled={!file || loading}
+          className="px-3 py-1.5 bg-purple-600 text-white text-xs rounded hover:bg-purple-700 disabled:opacity-50">
+          {loading ? 'Loading...' : '⬆ Load List'}
+        </button>
+        {listLoaded && (
+          <span className="text-xs text-green-700 font-medium">
+            ✓ {listLoaded.loaded} codes loaded
+            {listLoaded.preview && (
+              <span className="text-gray-500 ml-1">
+                ({Object.keys(listLoaded.preview).slice(0,3).join(', ')}...)
+              </span>
+            )}
+          </span>
+        )}
+      </div>
+
+      {/* Match */}
+      {listLoaded && (
+        <div className="flex items-center gap-3 flex-wrap">
+          <select value={model} onChange={e => setModel(e.target.value)}
+            className="border rounded px-2 py-1 text-xs">
+            <option value="claude-haiku-4-5">Haiku (fast)</option>
+            <option value="claude-sonnet-4-5">Sonnet (accurate)</option>
+          </select>
+          <button onClick={handleMatch} disabled={!!jobId && jobStatus?.status === 'running'}
+            className="px-3 py-1.5 bg-purple-700 text-white text-xs rounded hover:bg-purple-800 disabled:opacity-50">
+            {jobStatus?.status === 'running' ? 'Matching...' : '▶ Run Match'}
+          </button>
+
+          {jobStatus?.status === 'running' && (
+            <div className="flex items-center gap-2 flex-1 min-w-48">
+              <div className="flex-1 bg-purple-200 rounded-full h-1.5">
+                <div className="bg-purple-600 h-1.5 rounded-full transition-all"
+                  style={{ width: `${progressPct}%` }} />
+              </div>
+              <span className="text-xs text-purple-600 whitespace-nowrap">
+                {jobStatus.progress}/{jobStatus.total}
+              </span>
+            </div>
+          )}
+
+          {jobStatus?.status === 'done' && (
+            <span className="text-xs text-green-700 font-medium">
+              ✓ Matched {jobStatus.matched}/{jobStatus.total} items
+            </span>
+          )}
+          {jobStatus?.status === 'failed' && (
+            <span className="text-xs text-red-600">{jobStatus.error || 'Match failed'}</span>
+          )}
+        </div>
+      )}
+
+      {error && <p className="text-red-500 text-xs">{error}</p>}
     </div>
   )
 }
@@ -486,6 +623,7 @@ export default function App() {
         {session && (
           <>
             <EnrichPanel sessionId={session.session_id} onEnriched={handleEnriched} />
+            <MatchPanel sessionId={session.session_id} onMatched={handleEnriched} />
             <ResultsTable session={session} onItemUpdate={handleItemUpdate} />
           </>
         )}

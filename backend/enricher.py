@@ -122,19 +122,20 @@ DEFAULT_TAXONOMY = {
 
 def _get_api_config():
     """
-    Returns (endpoint, api_key) — Claudible first, Anthropic fallback.
-    Claudible: free internal proxy, same API format as Anthropic.
+    Returns (endpoint, api_key, provider) — Claudible first, Anthropic fallback.
+    Claudible: OpenAI-compatible API (chat/completions), NOT Anthropic native.
+    Base URL: https://claudible.io/v1
     """
     claudible_key = os.environ.get('CLAUDIBLE_API_KEY', '').strip()
     anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
 
     if claudible_key:
-        return 'https://api.claudible.com/v1/messages', claudible_key
+        return 'https://claudible.io/v1/chat/completions', claudible_key, 'claudible'
     elif anthropic_key:
         logger.info("Claudible key not set — falling back to Anthropic API (paid)")
-        return 'https://api.anthropic.com/v1/messages', anthropic_key
+        return 'https://api.anthropic.com/v1/messages', anthropic_key, 'anthropic'
     else:
-        return None, None
+        return None, None, None
 
 
 def enrich_items_batch(
@@ -148,18 +149,18 @@ def enrich_items_batch(
     AI-enrich parsed items with taxonomy codes, topics, keywords.
     Uses Claudible API (free) by default via CLAUDIBLE_API_KEY env var.
     """
-    endpoint, key = _get_api_config()
+    endpoint, key, provider = _get_api_config()
 
     # Allow explicit override (e.g. from tests)
     if api_key and not key:
-        endpoint = 'https://api.claudible.com/v1/messages'
+        endpoint = 'https://claudible.io/v1/chat/completions'
         key = api_key
+        provider = 'claudible'
 
     if not key:
         logger.warning("No API key found (CLAUDIBLE_API_KEY or ANTHROPIC_API_KEY) — skipping enrichment")
         return items
 
-    provider = "Claudible" if "claudible" in endpoint else "Anthropic"
     logger.info(f"AI enrichment: {provider} / {model} / {len(items)} items / batch={batch_size}")
 
     enriched = list(items)
@@ -237,24 +238,46 @@ Rules:
 
 
 def _call_ai(prompt: str, model: str, endpoint: str, api_key: str) -> str:
-    """Call Claudible or Anthropic API."""
+    """
+    Call Claudible (OpenAI-compatible) or Anthropic API.
+    Claudible uses /v1/chat/completions with Bearer auth.
+    Anthropic uses /v1/messages with x-api-key auth.
+    Cloudflare blocks default Python UA — must set User-Agent.
+    """
     import urllib.request
 
-    payload = json.dumps({
-        'model': model,
-        'max_tokens': 3000,
-        'messages': [{'role': 'user', 'content': prompt}]
-    }).encode()
+    is_claudible = 'claudible' in endpoint
 
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
+    if is_claudible:
+        # OpenAI-compatible format
+        payload = json.dumps({
+            'model': model,
+            'max_tokens': 3000,
+            'messages': [{'role': 'user', 'content': prompt}]
+        }).encode()
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'OpenClaw/1.0',  # required — Cloudflare blocks default Python UA
+        }
+    else:
+        # Anthropic native format
+        payload = json.dumps({
+            'model': model,
+            'max_tokens': 3000,
+            'messages': [{'role': 'user', 'content': prompt}]
+        }).encode()
+        headers = {
             'x-api-key': api_key,
             'anthropic-version': '2023-06-01',
             'content-type': 'application/json',
+            'User-Agent': 'OpenClaw/1.0',
         }
-    )
+
+    req = urllib.request.Request(endpoint, data=payload, headers=headers)
     with urllib.request.urlopen(req, timeout=60) as resp:
         d = json.loads(resp.read())
-        return d['content'][0]['text']
+        if is_claudible:
+            return d['choices'][0]['message']['content']
+        else:
+            return d['content'][0]['text']

@@ -288,3 +288,11 @@ def list_catalog():
             'available': os.path.exists(fpath),
         })
     return result
+
+
+from fastapi.staticfiles import StaticFiles
+
+# Serve frontend — must be LAST (catch-all)
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
+if os.path.exists(FRONTEND_DIR):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

@@ -1,23 +1,23 @@
 """
 AI Enrichment for parsed regulation items.
 Adds: topics, taxonomy_codes, keywords, importance, cross_refs.
-Uses Claudible (claude-haiku) for cost efficiency.
+
+Model priority:
+  1. Claudible API (free, internal proxy) — env: CLAUDIBLE_API_KEY
+  2. Anthropic API (paid fallback)        — env: ANTHROPIC_API_KEY
 """
 import json
 import re
 import time
+import os
 import logging
 from typing import List, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 # ── Default VN Tax Taxonomy ─────────────────────────────────────────────────────
-# Customizable per tax type. These are the "detailed topics" users care about most.
-# Format: { tax_type: { code: description } }
-
 DEFAULT_TAXONOMY = {
     "CIT": {
-        # Taxpayers & Scope
         "CIT-01": "Taxpayers & taxable entities",
         "CIT-02": "Permanent establishment (PE)",
         "CIT-03": "Taxable income — general",
@@ -25,29 +25,24 @@ DEFAULT_TAXONOMY = {
         "CIT-05": "Taxable income — real estate transfer",
         "CIT-06": "Taxable income — overseas income",
         "CIT-07": "CIT-exempt income",
-        # Deductions
         "CIT-08": "Deductible expenses — general conditions",
         "CIT-09": "Deductible expenses — specific categories",
         "CIT-10": "Non-deductible expenses",
         "CIT-11": "R&D expenses & additional deductions",
         "CIT-12": "Depreciation & amortization",
         "CIT-13": "Loss carry-forward",
-        # Rates & Calculation
         "CIT-14": "Standard CIT rate (20%)",
         "CIT-15": "Preferential CIT rates",
         "CIT-16": "CIT calculation method",
         "CIT-17": "Revenue recognition",
-        # Incentives
         "CIT-18": "CIT incentives — eligibility",
         "CIT-19": "CIT incentives — preferential rates",
         "CIT-20": "CIT incentives — tax exemption & reduction",
         "CIT-21": "CIT incentives — conditions & restrictions",
         "CIT-22": "Science & technology fund",
-        # International
         "CIT-23": "Foreign contractor tax (CIT component)",
         "CIT-24": "Transfer pricing — related parties",
         "CIT-25": "Double tax treaty interaction",
-        # Compliance
         "CIT-26": "Tax declaration & payment",
         "CIT-27": "Transition provisions",
     },
@@ -125,48 +120,62 @@ DEFAULT_TAXONOMY = {
 }
 
 
+def _get_api_config():
+    """
+    Returns (endpoint, api_key) — Claudible first, Anthropic fallback.
+    Claudible: free internal proxy, same API format as Anthropic.
+    """
+    claudible_key = os.environ.get('CLAUDIBLE_API_KEY', '').strip()
+    anthropic_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+
+    if claudible_key:
+        return 'https://api.claudible.com/v1/messages', claudible_key
+    elif anthropic_key:
+        logger.info("Claudible key not set — falling back to Anthropic API (paid)")
+        return 'https://api.anthropic.com/v1/messages', anthropic_key
+    else:
+        return None, None
+
+
 def enrich_items_batch(
     items: List[Dict],
     taxonomy: Optional[Dict] = None,
     model: str = 'claude-haiku-4-5',
     batch_size: int = 15,
-    api_key: Optional[str] = None,
+    api_key: Optional[str] = None,   # kept for backward compat, ignored if env vars set
 ) -> List[Dict]:
     """
     AI-enrich parsed items with taxonomy codes, topics, keywords.
-    Processes in batches to control cost.
-    
-    Args:
-        items:      Parsed items from parser.py
-        taxonomy:   Custom taxonomy dict {code: description}. 
-                    If None, uses DEFAULT_TAXONOMY for item's tax_type.
-        model:      AI model to use
-        batch_size: Items per API call (15-20 optimal)
-        api_key:    Anthropic/Claudible API key (or set ANTHROPIC_API_KEY env)
-    
-    Returns:
-        Items with added fields: topics, taxonomy_codes, keywords, importance, cross_refs
+    Uses Claudible API (free) by default via CLAUDIBLE_API_KEY env var.
     """
-    import os
-    key = api_key or os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDIBLE_API_KEY')
+    endpoint, key = _get_api_config()
+
+    # Allow explicit override (e.g. from tests)
+    if api_key and not key:
+        endpoint = 'https://api.claudible.com/v1/messages'
+        key = api_key
+
     if not key:
-        logger.warning("No API key — returning items without enrichment")
+        logger.warning("No API key found (CLAUDIBLE_API_KEY or ANTHROPIC_API_KEY) — skipping enrichment")
         return items
 
-    enriched = list(items)  # copy
+    provider = "Claudible" if "claudible" in endpoint else "Anthropic"
+    logger.info(f"AI enrichment: {provider} / {model} / {len(items)} items / batch={batch_size}")
+
+    enriched = list(items)
 
     for i in range(0, len(enriched), batch_size):
         batch = enriched[i:i + batch_size]
         tax_type = batch[0].get('tax_type', 'CIT')
-        
-        # Build taxonomy context for this tax type
+
+        # Build taxonomy context
         if taxonomy:
             tax_codes = taxonomy
         else:
             tax_codes = {}
             for tt in tax_type.split('/'):
                 tax_codes.update(DEFAULT_TAXONOMY.get(tt.strip(), {}))
-        
+
         taxonomy_list = '\n'.join(f'- [{k}] {v}' for k, v in list(tax_codes.items())[:40])
 
         items_text = '\n\n'.join(
@@ -195,16 +204,16 @@ Return ONLY valid JSON (no markdown), mapping reg_code to classification:
 }}
 
 Rules:
-- taxonomy_codes: 1-3 codes from the taxonomy list above that BEST match
+- taxonomy_codes: 1-3 codes from the taxonomy list that BEST match
 - topics: concise English phrase (max 80 chars)
 - keywords: 4-8 comma-separated keywords
 - importance: "high" (key rule), "medium" (standard provision), "low" (procedural/admin)
 - cross_refs: other articles/circulars referenced in the text (empty string if none)
-- If no good taxonomy match, use the closest one — never leave taxonomy_codes empty
+- Never leave taxonomy_codes empty — use closest match
 """
 
         try:
-            response_text = _call_ai(prompt, model, key)
+            response_text = _call_ai(prompt, model, endpoint, key)
             json_match = re.search(r'\{[\s\S]+\}', response_text)
             if json_match:
                 batch_result = json.loads(json_match.group())
@@ -217,49 +226,35 @@ Rules:
                         item['keywords'] = r.get('keywords', '')
                         item['importance'] = r.get('importance', 'medium')
                         item['cross_refs'] = r.get('cross_refs', '')
+                logger.info(f"Batch {i//batch_size + 1}/{(len(enriched)-1)//batch_size + 1} done")
         except Exception as e:
             logger.warning(f"Enrichment batch {i//batch_size + 1} failed: {e}")
 
-        # Rate limit
         if i + batch_size < len(enriched):
-            time.sleep(0.5)
+            time.sleep(0.3)
 
     return enriched
 
 
-def _call_ai(prompt: str, model: str, api_key: str) -> str:
-    """Call Anthropic/Claudible API directly."""
+def _call_ai(prompt: str, model: str, endpoint: str, api_key: str) -> str:
+    """Call Claudible or Anthropic API."""
     import urllib.request
 
-    # Claudible uses same API format as Anthropic
-    # Try Claudible endpoint first, fall back to Anthropic
-    endpoints = [
-        ('https://api.claudible.com/v1/messages', api_key),
-        ('https://api.anthropic.com/v1/messages', api_key),
-    ]
+    payload = json.dumps({
+        'model': model,
+        'max_tokens': 3000,
+        'messages': [{'role': 'user', 'content': prompt}]
+    }).encode()
 
-    for base_url, key in endpoints:
-        try:
-            payload = json.dumps({
-                'model': model,
-                'max_tokens': 3000,
-                'messages': [{'role': 'user', 'content': prompt}]
-            }).encode()
-
-            req = urllib.request.Request(
-                base_url,
-                data=payload,
-                headers={
-                    'x-api-key': key,
-                    'anthropic-version': '2023-06-01',
-                    'content-type': 'application/json',
-                }
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                d = json.loads(resp.read())
-                return d['content'][0]['text']
-        except Exception as e:
-            logger.debug(f"Endpoint {base_url} failed: {e}")
-            continue
-
-    raise RuntimeError("All AI endpoints failed")
+    req = urllib.request.Request(
+        endpoint,
+        data=payload,
+        headers={
+            'x-api-key': api_key,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json',
+        }
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        d = json.loads(resp.read())
+        return d['content'][0]['text']

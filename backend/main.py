@@ -205,15 +205,8 @@ def enrich_session(data: dict, background_tasks: BackgroundTasks):
     }
 
     def run():
-        from backend.enricher import DEFAULT_TAXONOMY, _get_api_config, _call_ai
-        import re as _re
-
-        endpoint, key, provider = _get_api_config()
-        api_key_fallback = os.environ.get('CLAUDIBLE_API_KEY') or os.environ.get('ANTHROPIC_API_KEY')
-        if not key:
-            key = api_key_fallback
-            endpoint = 'https://claudible.io/v1/chat/completions'
-            provider = 'claudible'
+        from backend.enricher import DEFAULT_TAXONOMY
+        endpoint, key, _ = _get_api_config_from_env()
         if not key:
             _jobs[job_id]['status'] = 'failed'
             _jobs[job_id]['error'] = 'No API key configured'
@@ -226,39 +219,36 @@ def enrich_session(data: dict, background_tasks: BackgroundTasks):
             for tt in tax_type.split('/'):
                 tax_codes.update(DEFAULT_TAXONOMY.get(tt.strip(), {}))
 
-        taxonomy_list = '\n'.join(f'- [{k}] {v}' for k, v in list(tax_codes.items())[:40])
+        taxonomy_list = '\n'.join(
+            '- [' + k + '] ' + v for k, v in list(tax_codes.items())[:40]
+        )
         tagged = 0
 
-        for i in range(0, len(items), batch_size):
-            batch = items[i:i + batch_size]
+        for idx in range(0, len(items), batch_size):
+            batch = items[idx:idx + batch_size]
             items_text = '\n\n'.join(
-                f'[{item["reg_code"]}]\n{item.get("paragraph_text","")[:400]}'
+                '[' + item['reg_code'] + ']\n' + item.get('paragraph_text', '')[:400]
                 for item in batch
             )
-            prompt = f"""You are a senior Vietnamese tax consultant.
-Analyze these regulation paragraphs and classify each one.
-
-TAXONOMY ({tax_type}):
-{taxonomy_list}
-
-ITEMS:
-{items_text}
-
-Return ONLY valid JSON mapping reg_code to classification:
-{{
-  "REG-CODE": {{
-    "taxonomy_codes": ["CIT-08"],
-    "topics": "Brief topic description (max 80 chars)",
-    "keywords": "keyword1, keyword2, keyword3",
-    "importance": "high|medium|low",
-    "cross_refs": "Article X, Circular Y or empty"
-  }}
-}}"""
+            prompt = (
+                'You are a senior Vietnamese tax consultant.\n'
+                'Analyze these regulation paragraphs and classify each one.\n\n'
+                'TAXONOMY (' + tax_type + '):\n' + taxonomy_list + '\n\n'
+                'ITEMS:\n' + items_text + '\n\n'
+                'Return ONLY valid JSON (no markdown, no code blocks) like:\n'
+                '{"reg_code_here": {"taxonomy_codes": ["CIT-08"], '
+                '"topics": "brief topic max 80 chars", '
+                '"keywords": "kw1, kw2, kw3", '
+                '"importance": "high", '
+                '"cross_refs": ""}}'
+            )
             try:
-                response = _call_ai(prompt, model, endpoint, key)
-                json_match = _re.search(r'\{{[\s\S]+\}}', response)
-                if json_match:
-                    result = json.loads(json_match.group())
+                response = _call_ai_openai(prompt, model, endpoint, key)
+                logger.info('Enrich batch %d preview: %s', idx//batch_size+1, response[:150])
+                brace_start = response.find('{')
+                brace_end = response.rfind('}')
+                if brace_start != -1 and brace_end != -1:
+                    result = json.loads(response[brace_start:brace_end+1])
                     for item in batch:
                         r = result.get(item['reg_code'], {})
                         if r:
@@ -268,16 +258,14 @@ Return ONLY valid JSON mapping reg_code to classification:
                             item['importance'] = r.get('importance', 'medium')
                             item['cross_refs'] = r.get('cross_refs', '')
                             tagged += 1
+                else:
+                    logger.warning('Enrich batch %d: no JSON in response: %s', idx//batch_size+1, response[:200])
             except Exception as e:
-                import logging
-                logging.warning(f'Enrich batch {i//batch_size+1} failed: {e}')
+                logger.warning('Enrich batch %d failed: %s', idx//batch_size+1, str(e))
 
-            _jobs[job_id]['progress'] = min(i + batch_size, len(items))
+            _jobs[job_id]['progress'] = min(idx + batch_size, len(items))
             _jobs[job_id]['matched'] = tagged
-
-            import time as _time
-            if i + batch_size < len(items):
-                _time.sleep(0.3)
+            time.sleep(0.3)
 
         _sessions[session_id]['items'] = items
         _jobs[job_id]['status'] = 'done'
@@ -580,5 +568,6 @@ from fastapi.staticfiles import StaticFiles
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.exists(FRONTEND_DIR):
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+
 
 

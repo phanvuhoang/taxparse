@@ -373,7 +373,7 @@ function MatchPanel({ sessionId, onMatched }) {
   const [listLoaded, setListLoaded] = useState(null)
   const [jobId, setJobId] = useState(null)
   const [jobStatus, setJobStatus] = useState(null)
-  const [model, setModel] = useState('claude-haiku-4-5')
+  const [model, setModel] = useState('claude-haiku-4.5')
 
   const handleUpload = async () => {
     if (!file) return
@@ -454,8 +454,8 @@ function MatchPanel({ sessionId, onMatched }) {
         <div className="flex items-center gap-3 flex-wrap">
           <select value={model} onChange={e => setModel(e.target.value)}
             className="border rounded px-2 py-1 text-xs">
-            <option value="claude-haiku-4-5">Haiku (fast)</option>
-            <option value="claude-sonnet-4-5">Sonnet (accurate)</option>
+            <option value="claude-haiku-4.5">Haiku (fast)</option>
+            <option value="claude-sonnet-4.6">Sonnet (accurate)</option>
           </select>
           <button onClick={handleMatch} disabled={!!jobId && jobStatus?.status === 'running'}
             className="px-3 py-1.5 bg-purple-700 text-white text-xs rounded hover:bg-purple-800 disabled:opacity-50">
@@ -493,7 +493,7 @@ function MatchPanel({ sessionId, onMatched }) {
 // ── Enrich Panel ──────────────────────────────────────────────────────────────
 function EnrichPanel({ sessionId, onEnriched }) {
   const { loading, error, call } = useApi()
-  const [model, setModel] = useState('claude-haiku-4-5')
+  const [model, setModel] = useState('claude-haiku-4.5')
   const [lastResult, setLastResult] = useState(null)
 
   const handleEnrich = async () => {
@@ -508,7 +508,7 @@ function EnrichPanel({ sessionId, onEnriched }) {
     })
     if (result) {
       setLastResult(result)
-      await onEnriched()
+      onEnriched(result.items || null)   // pass enriched items directly — no re-fetch needed
     }
   }
 
@@ -525,8 +525,8 @@ function EnrichPanel({ sessionId, onEnriched }) {
       </div>
       <select value={model} onChange={e => setModel(e.target.value)}
         className="border rounded px-2 py-1 text-sm ml-auto">
-        <option value="claude-haiku-4-5">Haiku (fast/cheap)</option>
-        <option value="claude-sonnet-4-5">Sonnet (better quality)</option>
+        <option value="claude-haiku-4.5">Haiku (fast/cheap)</option>
+        <option value="claude-sonnet-4.6">Sonnet (better quality)</option>
       </select>
       {error && <p className="text-red-500 text-xs">{error}</p>}
       <button onClick={handleEnrich} disabled={loading}
@@ -576,14 +576,17 @@ export default function App() {
     setSession(result)
   }
 
-  const handleEnriched = async () => {
+  const handleEnriched = (enrichedItems) => {
     if (!session) return
-    try {
-      const res = await fetch(`${API}/sessions/${session.session_id}?limit=5000`)
-      const data = await res.json()
-      setSession({ ...session, items: data.items, total: data.total, _enriched_at: Date.now() })
-    } catch (e) {
-      console.error('Failed to refresh after enrich:', e)
+    if (enrichedItems && enrichedItems.length > 0) {
+      // Use items returned directly from /enrich — no re-fetch (avoids session-not-found after restart)
+      setSession(s => ({ ...s, items: enrichedItems, total: enrichedItems.length, _enriched_at: Date.now() }))
+    } else {
+      // Fallback: try re-fetch from backend (items may still be in memory)
+      fetch(`${API}/sessions/${session.session_id}?limit=5000`)
+        .then(r => r.ok ? r.json() : null)
+        .then(data => { if (data?.items) setSession(s => ({ ...s, items: data.items, _enriched_at: Date.now() })) })
+        .catch(() => {})  // silent — session may have expired
     }
   }
 
@@ -639,3 +642,4 @@ export default function App() {
     </div>
   )
 }
+

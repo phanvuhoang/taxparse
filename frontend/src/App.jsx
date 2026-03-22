@@ -492,7 +492,7 @@ function MatchPanel({ sessionId, onMatched }) {
 
 // ── Enrich Panel ──────────────────────────────────────────────────────────────
 function EnrichPanel({ sessionId, onEnriched }) {
-  const [model, setModel] = useState('claude-haiku-4.5')
+  const [model, setModel] = useState('claude-sonnet-4.6')
   const [jobStatus, setJobStatus] = useState(null)   // {status, progress, total, matched}
   const [error, setError] = useState(null)
   const running = jobStatus?.status === 'running'
@@ -505,10 +505,13 @@ function EnrichPanel({ sessionId, onEnriched }) {
         setJobStatus(d)
         if (d.status === 'done' || d.status === 'failed') {
           clearInterval(iv)
-          if (d.status === 'done') onEnriched(null)  // trigger re-fetch from session
+          if (d.status === 'done') onEnriched(null)  // re-fetch session to update table
         }
-      } catch { clearInterval(iv) }
-    }, 1200)
+      } catch (e) {
+        console.error('poll error:', e)
+        clearInterval(iv)
+      }
+    }, 1500)
   }
 
   const handleEnrich = async () => {
@@ -550,28 +553,28 @@ function EnrichPanel({ sessionId, onEnriched }) {
         </button>
       </div>
 
-      {/* Progress bar */}
-      {running && (
+      {/* Progress — always visible once started, never disappears */}
+      {jobStatus && (
         <div className="space-y-1">
           <div className="flex justify-between text-xs text-amber-700">
-            <span>Processing batch {Math.ceil((jobStatus.progress||0)/15)}/{Math.ceil((jobStatus.total||1)/15)}…</span>
-            <span>{jobStatus.progress||0}/{jobStatus.total||'?'} items ({pct}%)</span>
+            {jobStatus.status === 'running' ? (
+              <>
+                <span>Processing… batch {Math.ceil((jobStatus.progress||0)/15)}/{Math.ceil((jobStatus.total||1)/15)}</span>
+                <span>{jobStatus.progress||0} / {jobStatus.total||'?'} items ({pct}%)</span>
+              </>
+            ) : jobStatus.status === 'done' ? (
+              <span className="text-green-700 font-medium">✓ Done — tagged {jobStatus.matched}/{jobStatus.total} items. Refresh table to see results.</span>
+            ) : (
+              <span className="text-red-600">⚠ {jobStatus.error || 'Enrichment failed'}</span>
+            )}
           </div>
           <div className="w-full bg-amber-200 rounded-full h-2">
-            <div className="bg-amber-600 h-2 rounded-full transition-all duration-500"
-              style={{ width: `${pct}%` }} />
+            <div
+              className={`h-2 rounded-full transition-all duration-500 ${jobStatus.status === 'done' ? 'bg-green-500' : jobStatus.status === 'failed' ? 'bg-red-400' : 'bg-amber-600'}`}
+              style={{ width: `${jobStatus.status === 'done' ? 100 : pct}%` }}
+            />
           </div>
         </div>
-      )}
-
-      {/* Result */}
-      {jobStatus?.status === 'done' && (
-        <p className="text-xs text-green-700 font-medium">
-          ✓ Tagged {jobStatus.matched}/{jobStatus.total} items — download CSV to see all results
-        </p>
-      )}
-      {jobStatus?.status === 'failed' && (
-        <p className="text-xs text-red-600">⚠ {jobStatus.error || 'Enrichment failed'}</p>
       )}
       {error && <p className="text-red-500 text-xs">⚠ {error}</p>}
     </div>
@@ -680,5 +683,6 @@ export default function App() {
     </div>
   )
 }
+
 
 

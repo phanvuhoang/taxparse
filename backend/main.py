@@ -183,30 +183,109 @@ def parse_catalog(background_tasks: BackgroundTasks):
 
 
 @app.post('/enrich')
-def enrich_session(data: dict):
+def enrich_session(data: dict, background_tasks: BackgroundTasks):
     """
-    AI-enrich a parsed session.
+    AI-enrich a parsed session. Runs as background job — returns job_id immediately.
     Body: { session_id, model?, batch_size?, custom_taxonomy? }
     """
     session_id = data.get('session_id')
     if session_id not in _sessions:
         raise HTTPException(404, 'Session not found')
 
-    items = _sessions[session_id]['items']
+    items = list(_sessions[session_id]['items'])  # snapshot
     tax_type = data.get('tax_type') or _sessions[session_id]['meta'].get('tax_type', 'CIT')
     custom_taxonomy = data.get('custom_taxonomy') or _custom_taxonomy.get(tax_type)
+    model = data.get('model', 'claude-haiku-4.5')
+    batch_size = data.get('batch_size', 15)
 
-    api_key = os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('CLAUDIBLE_API_KEY')
-    enriched = enrich_items_batch(
-        items,
-        taxonomy=custom_taxonomy,
-        model=data.get('model', 'claude-haiku-4.5'),
-        batch_size=data.get('batch_size', 15),
-        api_key=api_key,
-    )
-    _sessions[session_id]['items'] = enriched
-    tagged = sum(1 for i in enriched if i.get('taxonomy_codes'))
-    return {'session_id': session_id, 'enriched': tagged, 'total': len(enriched), 'items': enriched}
+    job_id = str(uuid.uuid4())[:8]
+    _jobs[job_id] = {
+        'status': 'running', 'progress': 0, 'total': len(items),
+        'matched': 0, 'session_id': session_id,
+    }
+
+    def run():
+        from backend.enricher import DEFAULT_TAXONOMY, _get_api_config, _call_ai
+        import re as _re
+
+        endpoint, key, provider = _get_api_config()
+        api_key_fallback = os.environ.get('CLAUDIBLE_API_KEY') or os.environ.get('ANTHROPIC_API_KEY')
+        if not key:
+            key = api_key_fallback
+            endpoint = 'https://claudible.io/v1/chat/completions'
+            provider = 'claudible'
+        if not key:
+            _jobs[job_id]['status'] = 'failed'
+            _jobs[job_id]['error'] = 'No API key configured'
+            return
+
+        tax_codes = {}
+        if custom_taxonomy:
+            tax_codes = custom_taxonomy
+        else:
+            for tt in tax_type.split('/'):
+                tax_codes.update(DEFAULT_TAXONOMY.get(tt.strip(), {}))
+
+        taxonomy_list = '\n'.join(f'- [{k}] {v}' for k, v in list(tax_codes.items())[:40])
+        tagged = 0
+
+        for i in range(0, len(items), batch_size):
+            batch = items[i:i + batch_size]
+            items_text = '\n\n'.join(
+                f'[{item["reg_code"]}]\n{item.get("paragraph_text","")[:400]}'
+                for item in batch
+            )
+            prompt = f"""You are a senior Vietnamese tax consultant.
+Analyze these regulation paragraphs and classify each one.
+
+TAXONOMY ({tax_type}):
+{taxonomy_list}
+
+ITEMS:
+{items_text}
+
+Return ONLY valid JSON mapping reg_code to classification:
+{{
+  "REG-CODE": {{
+    "taxonomy_codes": ["CIT-08"],
+    "topics": "Brief topic description (max 80 chars)",
+    "keywords": "keyword1, keyword2, keyword3",
+    "importance": "high|medium|low",
+    "cross_refs": "Article X, Circular Y or empty"
+  }}
+}}"""
+            try:
+                response = _call_ai(prompt, model, endpoint, key)
+                json_match = _re.search(r'\{{[\s\S]+\}}', response)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    for item in batch:
+                        r = result.get(item['reg_code'], {})
+                        if r:
+                            item['taxonomy_codes'] = ','.join(r.get('taxonomy_codes', []))
+                            item['topics'] = r.get('topics', '')
+                            item['keywords'] = r.get('keywords', '')
+                            item['importance'] = r.get('importance', 'medium')
+                            item['cross_refs'] = r.get('cross_refs', '')
+                            tagged += 1
+            except Exception as e:
+                import logging
+                logging.warning(f'Enrich batch {i//batch_size+1} failed: {e}')
+
+            _jobs[job_id]['progress'] = min(i + batch_size, len(items))
+            _jobs[job_id]['matched'] = tagged
+
+            import time as _time
+            if i + batch_size < len(items):
+                _time.sleep(0.3)
+
+        _sessions[session_id]['items'] = items
+        _jobs[job_id]['status'] = 'done'
+        _jobs[job_id]['matched'] = tagged
+        _jobs[job_id]['total'] = len(items)
+
+    background_tasks.add_task(run)
+    return {'job_id': job_id, 'session_id': session_id, 'total': len(items)}
 
 
 @app.get('/sessions/{session_id}')
@@ -501,4 +580,5 @@ from fastapi.staticfiles import StaticFiles
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
 if os.path.exists(FRONTEND_DIR):
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+
 
